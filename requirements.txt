@@ -1,0 +1,8 @@
+scholarly==1.7.11
+gspread==6.1.2
+google-auth==2.29.0
+streamlit==1.35.0
+pandas==2.2.2
+numpy==1.26.4
+plotly==5.22.0
+statsmodels==0.14.2
