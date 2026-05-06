@@ -6,7 +6,7 @@ Handles rate limiting with exponential backoff and retries per publication.
 import time
 import logging
 from datetime import datetime
-from scholarly import scholarly
+from scholarly import scholarly, ProxyGenerator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -14,6 +14,20 @@ log = logging.getLogger(__name__)
 SCHOLAR_ID = "-5aAUboAAAAJ"
 RETRY_DELAY = 10  # seconds between retries
 MAX_RETRIES = 3
+
+
+def _setup_proxy():
+    """
+    Use free proxies to avoid Google Scholar IP blocks on datacenter IPs
+    (e.g. GitHub Actions). Falls back to direct connection if none available.
+    """
+    pg = ProxyGenerator()
+    success = pg.FreeProxies()
+    if success:
+        scholarly.use_proxy(pg)
+        log.info("Using free proxy pool to bypass Scholar IP restrictions.")
+    else:
+        log.warning("No free proxies available — trying direct connection.")
 
 
 def _fill_with_retry(pub):
@@ -43,6 +57,7 @@ def scrape_profile() -> tuple[dict, list[dict]]:
     profile_snapshot: dict with date and profile-level metrics.
     papers_list: list of dicts, one per publication.
     """
+    _setup_proxy()
     log.info(f"Fetching Scholar profile: {SCHOLAR_ID}")
     author = scholarly.search_author_id(SCHOLAR_ID)
     author = scholarly.fill(author, sections=["basics", "indices", "counts", "publications"])

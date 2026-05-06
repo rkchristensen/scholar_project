@@ -64,8 +64,11 @@ def load_data():
         st.stop()
     spreadsheet = client.open_by_key(sid)
 
-    snapshots = pd.DataFrame(spreadsheet.worksheet("snapshots").get_all_records())
-    papers = pd.DataFrame(spreadsheet.worksheet("papers").get_all_records())
+    try:
+        snapshots = pd.DataFrame(spreadsheet.worksheet("snapshots").get_all_records())
+        papers = pd.DataFrame(spreadsheet.worksheet("papers").get_all_records())
+    except gspread.WorksheetNotFound:
+        return pd.DataFrame(), pd.DataFrame()
 
     snapshots["date"] = pd.to_datetime(snapshots["date"])
     papers["date"] = pd.to_datetime(papers["date"])
