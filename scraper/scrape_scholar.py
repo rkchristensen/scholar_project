@@ -1,112 +1,145 @@
 """
-Scrapes a Google Scholar profile and returns structured snapshot data.
-Handles rate limiting with exponential backoff and retries per publication.
+Scrapes a Google Scholar profile via SerpAPI (serpapi.com).
+Free tier: 100 searches/month — sufficient for weekly scraping.
+Requires SERPAPI_KEY environment variable.
 """
 
+import os
 import time
 import logging
 from datetime import datetime
-from scholarly import scholarly, ProxyGenerator
+from serpapi import GoogleSearch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
 SCHOLAR_ID = "-5aAUboAAAAJ"
-RETRY_DELAY = 10  # seconds between retries
-MAX_RETRIES = 3
 
 
-def _setup_proxy():
-    """
-    Use free proxies to avoid Google Scholar IP blocks on datacenter IPs
-    (e.g. GitHub Actions). Falls back to direct connection if none available.
-    """
-    pg = ProxyGenerator()
-    success = pg.FreeProxies()
-    if success:
-        scholarly.use_proxy(pg)
-        log.info("Using free proxy pool to bypass Scholar IP restrictions.")
-    else:
-        log.warning("No free proxies available — trying direct connection.")
-
-
-def _fill_with_retry(pub):
-    for attempt in range(MAX_RETRIES):
-        try:
-            return scholarly.fill(pub)
-        except Exception as e:
-            if attempt < MAX_RETRIES - 1:
-                wait = RETRY_DELAY * (2 ** attempt)
-                log.warning(f"Retry {attempt + 1} for publication after error: {e}. Waiting {wait}s.")
-                time.sleep(wait)
-            else:
-                log.error(f"Failed to fill publication after {MAX_RETRIES} attempts: {e}")
-                return pub  # return unfilled rather than crashing
-    return pub
+def _api_key():
+    key = os.environ.get("SERPAPI_KEY", "")
+    if not key:
+        raise EnvironmentError("SERPAPI_KEY environment variable is not set.")
+    return key
 
 
 def _count_coauthors(authors_str: str) -> int:
     if not authors_str:
         return 0
-    return len([a.strip() for a in authors_str.split(" and ") if a.strip()])
+    return len([a.strip() for a in authors_str.split(",") if a.strip()])
 
 
 def scrape_profile() -> tuple[dict, list[dict]]:
     """
-    Returns (profile_snapshot, papers_list).
-    profile_snapshot: dict with date and profile-level metrics.
-    papers_list: list of dicts, one per publication.
+    Returns (profile_snapshot, papers_list) using SerpAPI.
     """
-    _setup_proxy()
-    log.info(f"Fetching Scholar profile: {SCHOLAR_ID}")
-    author = scholarly.search_author_id(SCHOLAR_ID)
-    author = scholarly.fill(author, sections=["basics", "indices", "counts", "publications"])
-
+    key = _api_key()
     snapshot_date = datetime.utcnow().strftime("%Y-%m-%d")
+
+    # Fetch all articles (paginated, 100 per page)
+    all_articles = []
+    start = 0
+    while True:
+        params = {
+            "engine": "google_scholar_author",
+            "author_id": SCHOLAR_ID,
+            "api_key": key,
+            "num": 100,
+            "start": start,
+            "sort": "pubdate",
+        }
+        results = GoogleSearch(params).get_dict()
+
+        articles = results.get("articles", [])
+        if not articles:
+            break
+
+        all_articles.extend(articles)
+        log.info(f"  Fetched {len(all_articles)} articles so far...")
+
+        if len(articles) < 100:
+            break
+        start += 100
+        time.sleep(1)
+
+    # Profile-level metrics from the last response
+    author_info = results.get("author", {})
+    cited_by = results.get("cited_by", {})
+    table = cited_by.get("table", [])
+
+    def _metric(label):
+        for row in table:
+            if row.get("citations", {}).get("all") is not None and label == "citations":
+                return row["citations"]["all"]
+            if row.get("h_index", {}).get("all") is not None and label == "h_index":
+                return row["h_index"]["all"]
+            if row.get("i10_index", {}).get("all") is not None and label == "i10_index":
+                return row["i10_index"]["all"]
+        return 0
+
+    def _metric_5y(label):
+        for row in table:
+            if row.get("citations", {}).get("since_2021") is not None and label == "citations":
+                return row["citations"]["since_2021"]
+            if row.get("h_index", {}).get("since_2021") is not None and label == "h_index":
+                return row["h_index"]["since_2021"]
+            if row.get("i10_index", {}).get("since_2021") is not None and label == "i10_index":
+                return row["i10_index"]["since_2021"]
+        return 0
+
+    # SerpAPI returns a flat cited_by table; easier to read graph data
+    graph = cited_by.get("graph", [])
+    total_citations = sum(g.get("citations", 0) for g in graph) if graph else _metric("citations")
+    # Use the summary table for h-index / i10
+    summary = cited_by.get("table", [])
+    h_index = 0
+    h_index_5y = 0
+    i10_index = 0
+    i10_index_5y = 0
+    total_citations_all = 0
+    total_citations_5y = 0
+    for row in summary:
+        if "citations" in row:
+            total_citations_all = row["citations"].get("all", 0)
+            total_citations_5y = row["citations"].get("since_2021", 0)
+        if "h_index" in row:
+            h_index = row["h_index"].get("all", 0)
+            h_index_5y = row["h_index"].get("since_2021", 0)
+        if "i10_index" in row:
+            i10_index = row["i10_index"].get("all", 0)
+            i10_index_5y = row["i10_index"].get("since_2021", 0)
 
     profile = {
         "date": snapshot_date,
-        "h_index": author.get("hindex", 0),
-        "h_index_5y": author.get("hindex5y", 0),
-        "i10_index": author.get("i10index", 0),
-        "i10_index_5y": author.get("i10index5y", 0),
-        "total_citations": author.get("citedby", 0),
-        "total_citations_5y": author.get("citedby5y", 0),
+        "h_index": h_index,
+        "h_index_5y": h_index_5y,
+        "i10_index": i10_index,
+        "i10_index_5y": i10_index_5y,
+        "total_citations": total_citations_all,
+        "total_citations_5y": total_citations_5y,
     }
-    log.info(f"Profile snapshot: h={profile['h_index']}, citations={profile['total_citations']}")
+    log.info(f"Profile: h={h_index}, citations={total_citations_all}, papers={len(all_articles)}")
 
     papers = []
-    pubs = author.get("publications", [])
-    log.info(f"Filling {len(pubs)} publications (this takes a few minutes)...")
+    for article in all_articles:
+        authors_str = article.get("authors", "")
+        journal = article.get("publication", "")
+        # publication field often looks like "Journal Name, year" — strip year
+        if journal and "," in journal:
+            parts = journal.rsplit(",", 1)
+            if parts[-1].strip().isdigit():
+                journal = parts[0].strip()
 
-    for i, pub in enumerate(pubs):
-        filled = _fill_with_retry(pub)
-        bib = filled.get("bib", {})
-
-        authors_str = bib.get("author", "")
-        journal = (
-            bib.get("journal")
-            or bib.get("booktitle")
-            or bib.get("venue")
-            or ""
-        )
-
-        papers.append(
-            {
-                "date": snapshot_date,
-                "paper_id": filled.get("author_pub_id", f"unknown_{i}"),
-                "title": bib.get("title", ""),
-                "authors": authors_str,
-                "coauthor_count": _count_coauthors(authors_str),
-                "journal": journal.strip(),
-                "pub_year": bib.get("pub_year", ""),
-                "citations": filled.get("num_citations", 0),
-            }
-        )
-
-        if (i + 1) % 10 == 0:
-            log.info(f"  {i + 1}/{len(pubs)} publications filled")
-        time.sleep(1)  # gentle rate limiting
+        papers.append({
+            "date": snapshot_date,
+            "paper_id": article.get("citation_id", article.get("title", "")[:40]),
+            "title": article.get("title", ""),
+            "authors": authors_str,
+            "coauthor_count": _count_coauthors(authors_str),
+            "journal": journal,
+            "pub_year": article.get("year", ""),
+            "citations": article.get("cited_by", {}).get("value", 0),
+        })
 
     log.info(f"Done. {len(papers)} papers scraped.")
     return profile, papers
