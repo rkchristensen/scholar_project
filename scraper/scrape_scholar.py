@@ -1,144 +1,111 @@
 """
-Scrapes a Google Scholar profile via SerpAPI (serpapi.com).
-Free tier: 100 searches/month — sufficient for weekly scraping.
-Requires SERPAPI_KEY environment variable.
+Scrapes academic profile and citation data via the OpenAlex API (openalex.org).
+Free, no API key required, no CAPTCHA, no IP blocking.
+Author: Robert K. Christensen — OpenAlex ID A5059965749
 """
 
-import os
 import time
 import logging
+import urllib.request
+import json
 from datetime import datetime
-from serpapi import GoogleSearch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
 
-SCHOLAR_ID = "-5aAUboAAAAJ"
+OPENALEX_AUTHOR_ID = "A5059965749"
+HEADERS = {"User-Agent": "mailto:rkchristensen@gmail.com"}
 
 
-def _api_key():
-    key = os.environ.get("SERPAPI_KEY", "")
-    if not key:
-        raise EnvironmentError("SERPAPI_KEY environment variable is not set.")
-    return key
+def _get(url: str) -> dict:
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=30) as r:
+        return json.loads(r.read())
 
 
-def _count_coauthors(authors_str: str) -> int:
-    if not authors_str:
-        return 0
-    return len([a.strip() for a in authors_str.split(",") if a.strip()])
+def _fetch_all_works(author_id: str) -> list[dict]:
+    """Paginate through all works for this author using cursor pagination."""
+    works = []
+    cursor = "*"
+    page = 1
+    while True:
+        url = (
+            f"https://api.openalex.org/works"
+            f"?filter=author.id:{author_id}"
+            f"&per_page=200&cursor={cursor}"
+            f"&select=id,title,publication_year,cited_by_count,authorships,primary_location,biblio"
+        )
+        data = _get(url)
+        batch = data.get("results", [])
+        works.extend(batch)
+        log.info(f"  Page {page}: {len(batch)} works (total so far: {len(works)})")
+
+        next_cursor = data.get("meta", {}).get("next_cursor")
+        if not next_cursor or len(batch) == 0:
+            break
+        cursor = next_cursor
+        page += 1
+        time.sleep(0.5)
+
+    return works
+
+
+def _coauthor_count(work: dict, author_id: str) -> int:
+    """Count all authors on the paper."""
+    return len(work.get("authorships", []))
+
+
+def _journal(work: dict) -> str:
+    loc = work.get("primary_location") or {}
+    source = loc.get("source") or {}
+    return source.get("display_name", "")
+
+
+def _authors_str(work: dict) -> str:
+    names = []
+    for a in work.get("authorships", []):
+        name = a.get("author", {}).get("display_name", "")
+        if name:
+            names.append(name)
+    return ", ".join(names)
 
 
 def scrape_profile() -> tuple[dict, list[dict]]:
     """
-    Returns (profile_snapshot, papers_list) using SerpAPI.
+    Returns (profile_snapshot, papers_list) using OpenAlex.
     """
-    key = _api_key()
     snapshot_date = datetime.utcnow().strftime("%Y-%m-%d")
 
-    # Fetch all articles (paginated, 100 per page)
-    all_articles = []
-    start = 0
-    while True:
-        params = {
-            "engine": "google_scholar_author",
-            "author_id": SCHOLAR_ID,
-            "api_key": key,
-            "num": 100,
-            "start": start,
-            "sort": "pubdate",
-        }
-        results = GoogleSearch(params).get_dict()
+    log.info(f"Fetching author profile from OpenAlex: {OPENALEX_AUTHOR_ID}")
+    author_url = f"https://api.openalex.org/authors/{OPENALEX_AUTHOR_ID}"
+    author = _get(author_url)
 
-        articles = results.get("articles", [])
-        if not articles:
-            break
-
-        all_articles.extend(articles)
-        log.info(f"  Fetched {len(all_articles)} articles so far...")
-
-        if len(articles) < 100:
-            break
-        start += 100
-        time.sleep(1)
-
-    # Profile-level metrics from the last response
-    author_info = results.get("author", {})
-    cited_by = results.get("cited_by", {})
-    table = cited_by.get("table", [])
-
-    def _metric(label):
-        for row in table:
-            if row.get("citations", {}).get("all") is not None and label == "citations":
-                return row["citations"]["all"]
-            if row.get("h_index", {}).get("all") is not None and label == "h_index":
-                return row["h_index"]["all"]
-            if row.get("i10_index", {}).get("all") is not None and label == "i10_index":
-                return row["i10_index"]["all"]
-        return 0
-
-    def _metric_5y(label):
-        for row in table:
-            if row.get("citations", {}).get("since_2021") is not None and label == "citations":
-                return row["citations"]["since_2021"]
-            if row.get("h_index", {}).get("since_2021") is not None and label == "h_index":
-                return row["h_index"]["since_2021"]
-            if row.get("i10_index", {}).get("since_2021") is not None and label == "i10_index":
-                return row["i10_index"]["since_2021"]
-        return 0
-
-    # SerpAPI returns a flat cited_by table; easier to read graph data
-    graph = cited_by.get("graph", [])
-    total_citations = sum(g.get("citations", 0) for g in graph) if graph else _metric("citations")
-    # Use the summary table for h-index / i10
-    summary = cited_by.get("table", [])
-    h_index = 0
-    h_index_5y = 0
-    i10_index = 0
-    i10_index_5y = 0
-    total_citations_all = 0
-    total_citations_5y = 0
-    for row in summary:
-        if "citations" in row:
-            total_citations_all = row["citations"].get("all", 0)
-            total_citations_5y = row["citations"].get("since_2021", 0)
-        if "h_index" in row:
-            h_index = row["h_index"].get("all", 0)
-            h_index_5y = row["h_index"].get("since_2021", 0)
-        if "i10_index" in row:
-            i10_index = row["i10_index"].get("all", 0)
-            i10_index_5y = row["i10_index"].get("since_2021", 0)
-
+    stats = author.get("summary_stats", {})
     profile = {
         "date": snapshot_date,
-        "h_index": h_index,
-        "h_index_5y": h_index_5y,
-        "i10_index": i10_index,
-        "i10_index_5y": i10_index_5y,
-        "total_citations": total_citations_all,
-        "total_citations_5y": total_citations_5y,
+        "h_index": stats.get("h_index", 0),
+        "h_index_5y": stats.get("h_index", 0),       # OpenAlex doesn't split by 5y
+        "i10_index": stats.get("i10_index", 0),
+        "i10_index_5y": stats.get("i10_index", 0),
+        "total_citations": author.get("cited_by_count", 0),
+        "total_citations_5y": author.get("cited_by_count", 0),
     }
-    log.info(f"Profile: h={h_index}, citations={total_citations_all}, papers={len(all_articles)}")
+    log.info(f"Profile: h={profile['h_index']}, citations={profile['total_citations']}, papers={author.get('works_count')}")
+
+    log.info("Fetching all works...")
+    raw_works = _fetch_all_works(OPENALEX_AUTHOR_ID)
 
     papers = []
-    for article in all_articles:
-        authors_str = article.get("authors", "")
-        journal = article.get("publication", "")
-        # publication field often looks like "Journal Name, year" — strip year
-        if journal and "," in journal:
-            parts = journal.rsplit(",", 1)
-            if parts[-1].strip().isdigit():
-                journal = parts[0].strip()
-
+    for w in raw_works:
         papers.append({
             "date": snapshot_date,
-            "paper_id": article.get("citation_id", article.get("title", "")[:40]),
-            "title": article.get("title", ""),
-            "authors": authors_str,
-            "coauthor_count": _count_coauthors(authors_str),
-            "journal": journal,
-            "pub_year": article.get("year", ""),
-            "citations": article.get("cited_by", {}).get("value", 0),
+            "paper_id": w.get("id", "").replace("https://openalex.org/", ""),
+            "title": w.get("title", ""),
+            "authors": _authors_str(w),
+            "coauthor_count": _coauthor_count(w, OPENALEX_AUTHOR_ID),
+            "journal": _journal(w),
+            "pub_year": w.get("publication_year", ""),
+            "citations": w.get("cited_by_count", 0),
         })
 
     log.info(f"Done. {len(papers)} papers scraped.")

@@ -45,11 +45,16 @@ PAPER_HEADERS = [
 
 
 def _get_client() -> gspread.Client:
-    raw = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
-    if not raw:
-        raise EnvironmentError("GOOGLE_CREDENTIALS_JSON environment variable is not set.")
-    creds_dict = json.loads(raw)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    # Prefer a credentials file if present (local dev), fall back to env var (CI/cloud)
+    creds_file = os.path.join(os.path.dirname(__file__), "..", "credentials.json")
+    if os.path.exists(creds_file):
+        creds = Credentials.from_service_account_file(creds_file, scopes=SCOPES)
+    else:
+        raw = os.environ.get("GOOGLE_CREDENTIALS_JSON", "")
+        if not raw:
+            raise EnvironmentError("No credentials.json file found and GOOGLE_CREDENTIALS_JSON is not set.")
+        creds_dict = json.loads(raw)
+        creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
 
 
@@ -63,9 +68,21 @@ def _ensure_worksheet(spreadsheet, name: str, headers: list[str]) -> gspread.Wor
     return ws
 
 
+def _sheet_id() -> str:
+    sid = os.environ.get("GOOGLE_SHEET_ID", "")
+    if not sid:
+        # Try reading from .env file directly as fallback
+        env_file = os.path.join(os.path.dirname(__file__), "..", ".env")
+        if os.path.exists(env_file):
+            for line in open(env_file):
+                if line.startswith("GOOGLE_SHEET_ID="):
+                    sid = line.strip().split("=", 1)[1]
+    return sid
+
+
 def append_snapshot(profile: dict, papers: list[dict]) -> None:
     client = _get_client()
-    sheet_id = os.environ.get("GOOGLE_SHEET_ID", "")
+    sheet_id = _sheet_id()
     if not sheet_id:
         raise EnvironmentError("GOOGLE_SHEET_ID environment variable is not set.")
 
@@ -86,15 +103,13 @@ def append_snapshot(profile: dict, papers: list[dict]) -> None:
 
 def load_snapshots() -> list[dict]:
     client = _get_client()
-    sheet_id = os.environ.get("GOOGLE_SHEET_ID", "")
-    spreadsheet = client.open_by_key(sheet_id)
+    spreadsheet = client.open_by_key(_sheet_id())
     ws = spreadsheet.worksheet("snapshots")
     return ws.get_all_records()
 
 
 def load_papers() -> list[dict]:
     client = _get_client()
-    sheet_id = os.environ.get("GOOGLE_SHEET_ID", "")
-    spreadsheet = client.open_by_key(sheet_id)
+    spreadsheet = client.open_by_key(_sheet_id())
     ws = spreadsheet.worksheet("papers")
     return ws.get_all_records()
